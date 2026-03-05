@@ -1,38 +1,29 @@
 # Multithreaded HTTP Server
 
-A high-performance, concurrent C-based web server designed to handle multiple simultaneous client requests using a worker-pool architecture. This project emphasizes thread safety, efficient resource management, and atomic file operations.
+A concurrent web server implemented in C that utilizes a worker-thread pool architecture to handle multiple HTTP client requests simultaneously. This project demonstrates advanced systems programming concepts, including manual socket management, thread-safe synchronization, and atomic file I/O.
 
-## Features
+## Core Components
 
-- **Worker-Thread Pool**: Utilizes a producer-consumer model with a thread-safe queue to manage and distribute incoming connections across a pool of worker threads.
-- **Thread-Safe Synchronization**: Implements mutexes and condition variables to ensure data integrity within the shared request queue and audit logging.
-- **Advisory File Locking**: Uses `flock` to manage concurrent access to files, preventing race conditions between simultaneous `GET` and `PUT` requests.
-- **Modular Design**: Separates core server logic from low-level networking utilities and data structures for better maintainability.
+- **Thread-Pool Architecture**: Uses a dispatcher thread to accept connections and a pool of worker threads to process requests (GET and PUT).
+- **Thread-Safe Queue**: A custom FIFO queue using mutexes and condition variables to manage workload distribution.
+- **Atomic File Access**: Implements advisory file locking (`flock`) to prevent race conditions during concurrent read/write operations.
+- **Manual HTTP Parsing**: Custom-built request parsing logic to handle URIs, methods, and headers without external libraries.
 
-## Architecture
+## Building and Running
 
-- **`httpserver.c`**: The main driver containing the dispatcher loop and request handlers.
-- **`queue.c`**: A thread-safe FIFO queue implementation for managing connection file descriptors.
-- **`net_utils.h`**: A custom networking library providing abstraction for socket initialization and request parsing.
-- **`libnet_utils.a`**: Pre-compiled binary utility library for optimized network communication.
-
-## Build and Run
-
-### Requirements
-- Clang compiler
-- POSIX-compliant environment (Linux/macOS)
-- Pthreads library
-
-### Installation
-To compile the server using the provided Makefile:
+### Build
 ```bash
 make
 ```
 
 ### Usage
-Start the server by specifying the number of worker threads and the target port:
 ```bash
 ./httpserver [-t threads] <port>
 ```
-- -t threads: (Optional) The number of worker threads to spawn (default: 4).
-- <port>: The port number for the server to listen on.
+- -t threads: Set the number of worker threads (default is 4).
+- <port>: The port the server will listen on.
+
+### Technical Details
+- Languages: C
+- Libraries: Pthreads (POSIX Threads)
+- Concurrency Model: Producer-Consumer
