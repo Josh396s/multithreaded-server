@@ -1,38 +1,25 @@
-EXECBIN  = httpserver
-SOURCES  = $(wildcard *.c)
-HEADERS  = $(wildcard *.h)
-OBJECTS  = $(SOURCES:%.c=%.o)
-LIBRARY  =  libnet_utils.a
-FORMATS  = $(SOURCES:%.c=.format/%.c.fmt) $(HEADERS:%.h=.format/%.h.fmt)
+CC = clang
+CFLAGS = -Wall -Wextra -Werror -Wpedantic
+LDFLAGS = -lpthread
 
-CC       = clang
-FORMAT   = clang-format
-CFLAGS   = -Wall -Wpedantic -Werror -Wextra
+# List all your source files here
+SOURCES = httpserver.c queue.c net_utils.c
+HEADERS = queue.h net_utils.h
+OBJECTS = $(SOURCES:.c=.o)
+TARGET = httpserver
 
-.PHONY: all clean format
+all: $(TARGET)
 
-all: $(EXECBIN)
+$(TARGET): $(OBJECTS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(EXECBIN): $(OBJECTS) $(LIBRARY)
-	$(CC) -o $@ $^
-
-%.o : %.c %.h
+%.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $<
 
 clean:
-	rm -f $(EXECBIN) $(OBJECTS)
+	rm -f $(TARGET) $(OBJECTS)
 
-nuke: clean
-	rm -rf .format
+format:
+	clang-format -i -style=file *.[ch]
 
-format: $(FORMATS)
-
-.format/%.c.fmt: %.c
-	mkdir -p .format
-	$(FORMAT) -i $<
-	touch $@
-
-.format/%.h.fmt: %.h
-	mkdir -p .format
-	$(FORMAT) -i $<
-	touch $@
+.PHONY: all clean format
