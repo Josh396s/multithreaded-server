@@ -1,3 +1,9 @@
+#include "asgn2_helper_funcs.h"
+#include "connection.h"
+#include "response.h"
+#include "request.h"
+#include "queue.h"
+
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -10,255 +16,196 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/file.h>
-#include <regex.h>
-#include <assert.h>
-#include <stdint.h>
-#include <stdbool.h>
 
-#include "asgn2_helper_funcs.h"
-#include "connection.h"
-#include "response.h"
-#include "request.h"
-#include "queue.h"
-#include "global.h"
-#include "parse.h"
+#define INT2VOID(i) (void *) (uintptr_t) (i)
+#define VOID2INT(p) (int) (uintptr_t) (p)
 
+void handle_connection(int);
+void handle_get(conn_t *);
+void handle_put(conn_t *);
+void handle_unsupported(conn_t *);
 
-#define BUFFERSIZE 4096
+// Global queue for thread communication
+static queue_t *que;
 
-int main(int argc, char *argv[]) {
-    int port;
-    int localhost;
-    int client;
-    char grade = '\0';
+// Mutexes for thread safety
+pthread_mutex_t audit_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t file_op_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void *worker_thread(void *arg) {
+    (void) arg;
+    while (true) {
+        void *conn_ptr;
+        queue_pop(que, &conn_ptr);
+        int connfd = VOID2INT(conn_ptr);
+        handle_connection(connfd);
+    }
+    return NULL;
+}
+
+int main(int argc, char **argv) {
+    int opt = 0;
+    int num_threads = 4; // Default thread count
+
+    while ((opt = getopt(argc, argv, "t:")) != -1) {
+        switch (opt) {
+        case 't':
+            num_threads = atoi(optarg);
+            if (num_threads <= 0) {
+                warnx("Invalid number of threads: %s", optarg);
+                return EXIT_FAILURE;
+            }
+            break;
+        default:
+            fprintf(stderr, "usage: ./httpserver [-t threads] <port>\n");
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (optind >= argc) {
+        warnx("missing port number");
+        fprintf(stderr, "usage: ./httpserver [-t threads] <port>\n");
+        return EXIT_FAILURE;
+    }
+
+    char *endptr = NULL;
+    size_t port = (size_t) strtoull(argv[optind], &endptr, 10);
+    if (endptr && *endptr != '\0') {
+        warnx("invalid port number: %s", argv[optind]);
+        return EXIT_FAILURE;
+    }
+
+    signal(SIGPIPE, SIG_IGN);
+
+    // Initialize the queue and threads
+    que = queue_new(num_threads);
+    pthread_t threads[num_threads];
+    for (int i = 0; i < num_threads; i++) {
+        pthread_create(&threads[i], NULL, worker_thread, NULL);
+    }
+
     Listener_Socket sock;
-
-    //Ensure only 2 arguments are provided
-    if (argc > 2 || argc <= 1) {
-        fprintf(stderr, "Invalid Port\n");
-        exit(1);
+    if (listener_init(&sock, port) != 0) {
+        return EXIT_FAILURE;
     }
 
-    //Checking to make sure the port is a valid integer
-    char *port_char = argv[1];
-    for (unsigned long i = 0; i < strlen(port_char); i++) {
-        if (isdigit(port_char[i]) == 0) {
-            fprintf(stderr, "Invalid Port\n");
-            exit(1);
+    while (true) {
+        int connfd = listener_accept(&sock);
+        if (connfd >= 0) {
+            queue_push(que, INT2VOID(connfd));
         }
     }
 
-    //Checking to see if port is in valid range
-    port = atoi(port_char);
-    if ((port < 1) || (port > 65535)) { //Check to see if port is valid [1, 65535]
-        fprintf(stderr, "Invalid Port\n");
-        exit(1);
+    return EXIT_SUCCESS;
+}
+
+void audit(const char *req, char *file_name, uint16_t response_num, char *Req_id) {
+    if (Req_id == NULL) {
+        Req_id = "0";
+    }
+    pthread_mutex_lock(&audit_mutex);
+    fprintf(stderr, "%s,/%s,%d,%s\n", req, file_name, response_num, Req_id);
+    pthread_mutex_unlock(&audit_mutex);
+}
+
+void handle_connection(int connfd) {
+    conn_t *conn = conn_new(connfd);
+    const Response_t *res = conn_parse(conn);
+
+    if (res != NULL) {
+        conn_send_response(conn, res);
+    } else {
+        const Request_t *req = conn_get_request(conn);
+        if (req == &REQUEST_GET) {
+            handle_get(conn);
+        } else if (req == &REQUEST_PUT) {
+            handle_put(conn);
+        } else {
+            handle_unsupported(conn);
+        }
     }
 
-    //Bind to port
-    localhost = listener_init(&sock, port);
-    if (localhost != 0) { //Check to see if
-        fprintf(stderr, "Invalid Port\n");
-        exit(1);
+    conn_delete(&conn);
+    close(connfd);
+}
+
+void handle_get(conn_t *conn) {
+    char *uri = conn_get_uri(conn);
+    char *Req_id = conn_get_header(conn, "Request-Id");
+    const Response_t *res = NULL;
+    int fd = -1;
+
+    // Use a mutex to safely check file existence and open
+    pthread_mutex_lock(&file_op_mutex);
+    fd = open(uri, O_RDONLY);
+    if (fd < 0) {
+        if (errno == ENOENT) res = &RESPONSE_NOT_FOUND;
+        else if (errno == EACCES) res = &RESPONSE_FORBIDDEN;
+        else res = &RESPONSE_INTERNAL_SERVER_ERROR;
+        pthread_mutex_unlock(&file_op_mutex);
+        goto out;
     }
 
-    while (1) {
-        //Accept the connection
-        client = listener_accept(&sock);
+    // Advisory read lock
+    flock(fd, LOCK_SH);
+    pthread_mutex_unlock(&file_op_mutex);
 
-        //Create buff
-        char buffer[BUFFERSIZE];
-
-        //Create a request struct
-        Request *req = request_create();
-
-        //Create struct for the Status_code
-        Status_Code status_code = status_code_create();
-
-        //Read in info from the client
-        int bytes_read = read_until(client, buffer, BUFFERSIZE, "\r\n\r\n");
-        buffer[bytes_read] = '\0';
-        if (bytes_read == -1) {
-            get_status(400, &status_code);
-            print_status_code(status_code, client, 0);
-            request_delete(req);
-            close(client);
-            continue;
-        }
-
-        //CHECKING FOR CASE WHERE THERE IS CONTENT AFTER "\r\n\r\n"
-        int count = 0;
-        int request_line_end = 0;
-        while (count < bytes_read) {
-            if (buffer[count] == '\r' && buffer[count + 1] == '\n') {
-                if (buffer[count - 2] == '\r' && buffer[count - 1] == '\n') {
-                    if (count < bytes_read) {
-                        request_line_end = count + 2;
-                        break;
-                    }
-                }
-            }
-            count++;
-        }
-
-        //Making seperate buffer for Message body for PUT request
-        char message_body[4096];
-        int message_len = 0;
-        if (request_line_end != 0) {
-            for (int i = 0; i < (bytes_read - request_line_end); i++) {
-                message_body[i] = buffer[request_line_end + i];
-                message_len++;
-            }
-        }
-
-        int check_parse = parse_request(buffer, req, request_line_end);
-
-        //Ensuring that the request was valid
-        if (check_parse != 0 && check_parse != 201) {
-            get_status(check_parse, &status_code);
-            print_status_code(status_code, client, 0);
-            request_delete(req);
-            close(client);
-            continue;
-        }
-
-        //Checking for valid command
-        while (true) {
-            if (strcmp(get_request_command(req), "GET") == 0) {
-                grade = 'G';
-                break;
-            } else {
-                grade = 'P';
-                break;
-            }
-        }
-
-        switch (grade) {
-
-        case 'G': //COMMAND: "GET"--------------------------------------------------------------------------------
-        {
-            int infile = open(get_target_path(req), O_RDONLY);
-
-            //If file DNE
-            if (infile == -1) {
-                get_status(404, &status_code);
-                print_status_code(status_code, client, 0);
-                request_delete(req);
-                close(client);
-                continue;
-            }
-
-            //Getting the size of the file
-            struct stat stbuf;
-            stat(get_target_path(req), &stbuf);
-            long long file_size = stbuf.st_size;
-
-            get_status(200, &status_code);
-            print_status_code(status_code, client, file_size);
-
-            int out_count = 1;
-            //Read from infile and print to stdout
-            while (out_count != 0) {
-                out_count = pass_bytes(infile, client, file_size);
-
-                //Error reading from infile
-                if (out_count == -1) {
-                    fprintf(stderr, "READING FROM INFILE FAILED");
-                    get_status(500, &status_code);
-                    print_status_code(status_code, client, 0);
-                    request_delete(req);
-                    close(infile);
-                    close(client);
-                    break;
-                }
-
-                //Error writing to client
-                if (out_count == -2) {
-                    fprintf(stderr, "WRITING TO CLIENT FAILED");
-                    get_status(500, &status_code);
-                    print_status_code(status_code, client, 0);
-                    request_delete(req);
-                    close(infile);
-                    close(client);
-                    break;
-                }
-            }
-            if (out_count == -1 || out_count == -2) {
-                continue;
-            }
-
-            request_delete(req);
-            close(infile);
-            close(client);
-            break;
-        }
-
-        case 'P': //COMMAND: "PUT"--------------------------------------------------------------------------------
-        {
-            //Checking if file EXISTS and has WRITE ACESS
-            char *out_file = get_target_path(req);
-            int outfile;
-
-            //If file Exists
-            if (access(out_file, F_OK | W_OK) == 0) {
-                get_status(200, &status_code);
-                print_status_code(status_code, client, -10);
-
-                outfile = open(out_file, O_RDWR | O_CREAT | O_TRUNC, 0666);
-            } else {
-                outfile = open(out_file, O_RDWR | O_CREAT | O_TRUNC, 0666);
-
-                //If outfile could not be created
-                if (outfile == -1) {
-                    get_status(404, &status_code);
-                    print_status_code(status_code, client, 0);
-                    request_delete(req);
-                    close(client);
-                    continue;
-                }
-
-                //If outfile was created successfully
-                get_status(201, &status_code);
-                print_status_code(status_code, client, 0);
-            }
-
-            //Write any remaining bytes from message body already read
-            int check_write = 0;
-            if (request_line_end < bytes_read && request_line_end != 0) {
-                if (get_header_value(req) < bytes_read - request_line_end) {
-                    check_write = write_all(outfile, message_body, get_header_value(req));
-                } else {
-                    check_write = write_all(outfile, message_body, bytes_read - request_line_end);
-                }
-            }
-            if (check_write == -1) {
-                fprintf(stderr, "WRITING TO OUTFILE FAILED");
-                get_status(500, &status_code);
-                print_status_code(status_code, client, 0);
-                request_delete(req);
-                close(outfile);
-                close(client);
-                break;
-            }
-
-            check_write = pass_bytes(client, outfile, get_header_value(req));
-
-            if (check_write == -1 || check_write == -2) {
-                fprintf(stderr, "WRITING TO OUTFILE FAILED");
-                get_status(500, &status_code);
-                print_status_code(status_code, client, 0);
-                request_delete(req);
-                close(outfile);
-                close(client);
-                break;
-            }
-
-            request_delete(req);
-            close(outfile);
-            close(client);
-            break;
-        }
-        }
+    struct stat st;
+    fstat(fd, &st);
+    if (S_ISDIR(st.st_mode)) {
+        res = &RESPONSE_FORBIDDEN;
+        goto out;
     }
-    return 0;
+
+    res = &RESPONSE_OK;
+    conn_send_file(conn, fd, st.st_size);
+
+out:
+    if (res != &RESPONSE_OK) conn_send_response(conn, res);
+    audit("GET", uri, response_get_code(res), Req_id);
+    if (fd >= 0) {
+        flock(fd, LOCK_UN);
+        close(fd);
+    }
+}
+
+void handle_put(conn_t *conn) {
+    char *uri = conn_get_uri(conn);
+    char *Req_id = conn_get_header(conn, "Request-Id");
+    const Response_t *res = NULL;
+    int fd = -1;
+
+    pthread_mutex_lock(&file_op_mutex);
+    bool existed = (access(uri, F_OK) == 0);
+    fd = open(uri, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    if (fd < 0) {
+        if (errno == EACCES || errno == EISDIR) res = &RESPONSE_FORBIDDEN;
+        else res = &RESPONSE_INTERNAL_SERVER_ERROR;
+        pthread_mutex_unlock(&file_op_mutex);
+        goto out;
+    }
+
+    // Advisory exclusive lock for writing
+    flock(fd, LOCK_EX);
+    pthread_mutex_unlock(&file_op_mutex);
+
+    res = conn_recv_file(conn, fd);
+    if (res == NULL) {
+        res = existed ? &RESPONSE_OK : &RESPONSE_CREATED;
+    }
+
+out:
+    conn_send_response(conn, res);
+    audit("PUT", uri, response_get_code(res), Req_id);
+    if (fd >= 0) {
+        flock(fd, LOCK_UN);
+        close(fd);
+    }
+}
+
+void handle_unsupported(conn_t *conn) {
+    const Response_t *res = &RESPONSE_NOT_IMPLEMENTED;
+    conn_send_response(conn, res);
+    audit(request_get_str(conn_get_request(conn)), conn_get_uri(conn), 501, conn_get_header(conn, "Request-Id"));
 }
